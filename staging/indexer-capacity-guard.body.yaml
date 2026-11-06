@@ -1,0 +1,105 @@
+name: indexer-capacity-guard
+description: >-
+  Snapshot OpenSearch indexer capacity and assert the thresholds from the
+  July heap-exhaustion post-incident report. High severity means page now;
+  medium means fix this week. Run with --fail-on high on a schedule.
+trigger:
+  schedule: "*/5 * * * *"
+tags:
+  team: platform
+  service: wazuh-indexer
+vaults: [default]
+jobs:
+  - name: collect
+    description: Read node JVM, breaker and cluster-health stats
+    steps:
+      - name: snapshot
+        task:
+          type: behavior
+          behavior: indexer
+          methodName: snapshot
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+  - name: verify
+    description: Assert capacity thresholds against the snapshot
+    steps:
+      - name: cluster-not-red
+        task:
+          type: assert
+          expr: data.latest("indexer", "capacity").attributes.status != "red"
+          message: >-
+            Cluster is RED: a primary shard is unassigned
+          severity: high
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: retained-heap-critical
+        task:
+          type: assert
+          expr: data.latest("indexer", "capacity").attributes.maxOldGenPercent < 85
+          message: >-
+            Old generation at ${{ data.latest("indexer", "capacity").attributes.maxOldGenPercent }}%
+            of heap on the worst node; the parent breaker will start rejecting requests
+          severity: high
+        dependsOn: []
+        weight: 1
+        allowFailure: false
+      - name: breaker-trips-not-increasing
+        task:
+          type: assert
+          expr: >-
+            size(data.listVersions("indexer", "capacity")) < 2 ||
+            data.latest("indexer", "capacity").attributes.totalParentBreakerTrips <=
+            data.version("indexer", "capacity",
+              data.listVersions("indexer", "capacity")[size(data.listVersions("indexer", "capacity")) - 2]
+            ).attributes.totalParentBreakerTrips
+          message: >-
+            Parent circuit breaker tripped since the last snapshot
+            (now ${{ data.latest("indexer", "capacity").attributes.totalParentBreakerTrips }} trips)
+          severity: high
+        dependsOn: []
+        weight: 2
+        allowFailure: false
+      - name: retained-heap-warning
+        task:
+          type: assert
+          expr: data.latest("indexer", "capacity").attributes.maxOldGenPercent < 70
+          message: >-
+            Old generation at ${{ data.latest("indexer", "capacity").attributes.maxOldGenPercent }}%
+            of heap; plan capacity before it reaches 85%
+          severity: medium
+        dependsOn: []
+        weight: 3
+        allowFailure: false
+      - name: shard-density
+        task:
+          type: assert
+          expr: data.latest("indexer", "capacity").attributes.shardsPerHeapGiB <= 20.0
+          message: >-
+            ${{ data.latest("indexer", "capacity").attributes.shardsPerHeapGiB }} shards per GiB of heap
+            (${{ data.latest("indexer", "capacity").attributes.shardsPerNode }} per node);
+            budget is 20. Reduce primaries per index before adding heap.
+          severity: medium
+        dependsOn: []
+        weight: 4
+        allowFailure: false
+      - name: all-replicas-assigned
+        task:
+          type: assert
+          expr: data.latest("indexer", "capacity").attributes.unassignedShards == 0
+          message: >-
+            ${{ data.latest("indexer", "capacity").attributes.unassignedShards }} replica shards unassigned
+            (cluster ${{ data.latest("indexer", "capacity").attributes.status }})
+          severity: medium
+        dependsOn: []
+        weight: 5
+        allowFailure: false
+    dependsOn:
+      - job: collect
+        condition:
+          type: succeeded
+    weight: 1
+version: 1
